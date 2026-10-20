@@ -1,0 +1,111 @@
+import * as pdfjsLib from 'pdfjs-dist'
+import type { PDFDocumentLoadingTask, PDFDocumentProxy, PDFPageProxy, PageViewport } from 'pdfjs-dist'
+import type { IRenderer, PageDimensions } from '../types/index'
+
+// CDN fallback URL used when the consumer hasn't configured a worker.
+// Applied lazily inside `load()` (NOT at module load) so any consumer
+// override is preserved regardless of import order.
+// unpkg is used instead of cdnjs because it mirrors every npm release
+// immediately, so the URL is always valid for the installed version.
+const DEFAULT_WORKER_SRC =
+  `https://unpkg.com/pdfjs-dist@${pdfjsLib.version}/build/pdf.worker.min.mjs`
+
+interface PdfDims {
+  widthPts: number
+  heightPts: number
+}
+
+export class PDFRenderer implements IRenderer {
+  private _task: PDFDocumentLoadingTask | null = null
+  private _pdf: PDFDocumentProxy | null = null
+  private _baseViewports: PageViewport[] = []
+  private _pdfPages: PDFPageProxy[] = []
+  private _renderTasks: Array<ReturnType<PDFPageProxy['render']> | null> = []
+  private _pageCount = 0
+
+  get pageCount(): number { return this._pageCount }
+
+  async load(url: string): Promise<number> {
+    // Lazy CDN fallback — only kicks in if the consumer hasn't pinned
+    // a worker. Setting this at call-time (not module-load time) means
+    // a consumer that overrides pdfjsLib.GlobalWorkerOptions.workerSrc
+    // anywhere before calling load() always wins.
+    if (!pdfjsLib.GlobalWorkerOptions.workerSrc) {
+      pdfjsLib.GlobalWorkerOptions.workerSrc = DEFAULT_WORKER_SRC
+    }
+
+    const task   = pdfjsLib.getDocument({ url, cMapPacked: true })
+    this._task   = task
+    this._pdf    = await task.promise
+    this._pageCount = this._pdf.numPages
+
+    this._pdfPages = await Promise.all(
+      Array.from({ length: this._pageCount }, (_, i) => this._pdf!.getPage(i + 1))
+    )
+
+    this._baseViewports = this._pdfPages.map((p) => p.getViewport({ scale: 1.0 }))
+
+    return this._pageCount
+  }
+
+  async renderPage(pageIndex: number, canvasEl: HTMLCanvasElement, displayScale?: number): Promise<PageDimensions> {
+    const scale = displayScale ?? 1
+    const page  = this._pdfPages[pageIndex]
+    if (!page) return { width: 0, height: 0 }
+
+    const dpr = window.devicePixelRatio || 1
+
+    const layoutVP = page.getViewport({ scale })
+    const cssW     = Math.round(layoutVP.width)
+    const cssH     = Math.round(layoutVP.height)
+
+    canvasEl.width  = Math.round(cssW * dpr)
+    canvasEl.height = Math.round(cssH * dpr)
+    canvasEl.style.width  = cssW + 'px'
+    canvasEl.style.height = cssH + 'px'
+
+    const ctx = canvasEl.getContext('2d')
+    if (!ctx) return { width: cssW, height: cssH }
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
+
+    this._renderTasks[pageIndex]?.cancel()
+
+    // pdfjs-dist 5.x requires the `canvas` parameter in addition to canvasContext
+    const task = page.render({ canvasContext: ctx, canvas: canvasEl, viewport: layoutVP })
+    this._renderTasks[pageIndex] = task
+
+    try {
+      await task.promise
+    } catch (e: unknown) {
+      if ((e as { name?: string })?.name !== 'RenderingCancelledException') throw e
+    }
+
+    return { width: cssW, height: cssH }
+  }
+
+  getScale(containerWidth: number, padding = 0.92): number {
+    if (!this._baseViewports.length) return 1
+    return (containerWidth * padding) / this._baseViewports[0].width
+  }
+
+  getBaseViewport(pageIndex: number): PageViewport {
+    return this._baseViewports[pageIndex] ?? ({ width: 612, height: 792 } as unknown as PageViewport)
+  }
+
+  getPdfDims(pageIndex: number): PdfDims {
+    const vp = this._baseViewports[pageIndex]
+    if (!vp) return { widthPts: 612, heightPts: 792 }
+    return { widthPts: vp.width, heightPts: vp.height }
+  }
+
+  destroy(): void {
+    this._renderTasks.forEach((t) => t?.cancel())
+    if (this._task) { void this._task.destroy(); this._task = null }
+    this._pdf = null
+    this._baseViewports = []
+    this._pdfPages      = []
+    this._renderTasks   = []
+    this._pageCount     = 0
+  }
+
+}
